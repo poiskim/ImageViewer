@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">이미지 뷰어</string>
+    <string name="url_hint">사이트 주소 입력</string>
+    <string name="back">뒤로</string>
+    <string name="view_images">이미지 보기</string>
+    <string name="more">메뉴</string>
+</resources>

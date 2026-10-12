@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="no-referrer-when-downgrade">
+<title>viewer</title>
+<style>
+  :root { --hud: rgba(20, 20, 20, .88); --fg: #f2f2f2; --muted: #9a9a9a; --accent: #ffb74d; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: var(--fg); overflow: hidden;
+    font-family: system-ui, -apple-system, "Noto Sans KR", sans-serif;
+    -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  #stage { position: fixed; inset: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  #img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; transform-origin: 50% 50%; }
+  /* 세로로 긴 이미지(웹툰 등)는 가로에 맞추고 위아래로 스크롤 */
+  #stage.scroll { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; overflow-x: hidden; overflow-y: auto; touch-action: pan-y; }
+  #stage.scroll #img { width: 100%; height: auto; max-width: none; max-height: none; margin: auto 0; flex: none; }
+
+  #status { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: 24px; color: var(--muted); font-size: 14px; text-align: center; pointer-events: none; }
+  #status button { pointer-events: auto; }
+  #status .url { font-size: 11px; opacity: .7; word-break: break-all; max-width: 90%; }
+  .spin { width: 28px; height: 28px; border: 3px solid #3a3a3a; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #corner { position: fixed; right: 10px; bottom: 8px; padding: 2px 8px; border-radius: 10px; font-size: 12px;
+    color: rgba(255, 255, 255, .6); background: rgba(0, 0, 0, .4); font-variant-numeric: tabular-nums; pointer-events: none; transition: opacity .2s; }
+
+  .hud { position: fixed; left: 0; right: 0; background: var(--hud); transition: transform .2s ease, opacity .2s ease; }
+  #top { top: 0; display: flex; align-items: center; gap: 8px; padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); }
+  #bottom { bottom: 0; padding: 14px 16px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+  body.hide .hud { opacity: 0; pointer-events: none; }
+  body.hide #top { transform: translateY(-100%); }
+  body.hide #bottom { transform: translateY(100%); }
+  body:not(.hide) #corner { opacity: 0; }
+
+  #title { flex: 1; min-width: 0; font-size: 14px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #count { font-size: 15px; font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-size: 13px; color: var(--fg); background: #2c2c2c; border: 0; border-radius: 18px; padding: 9px 14px; }
+  button:active { background: #3a3a3a; }
+  #close { background: transparent; font-size: 22px; line-height: 1; padding: 6px 10px; }
+  #slider { width: 100%; margin: 0 0 14px; accent-color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hint { margin-top: 10px; font-size: 11px; color: var(--muted); }
+
+  #toast { position: fixed; left: 50%; bottom: 48px; transform: translateX(-50%); padding: 8px 16px; border-radius: 18px;
+    background: rgba(40, 40, 40, .95); font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; white-space: nowrap; }
+  #toast.on { opacity: 1; }
+</style>
+</head>
+<body class="hide">
+<div id="stage"><img id="img" alt="" draggable="false"></div>
+<div id="status"></div>
+<div id="corner"></div>
+
+<div id="top" class="hud">
+  <button id="close" aria-label="닫기">✕</button>
+  <div id="title"></div>
+  <div id="count"></div>
+</div>
+<div id="bottom" class="hud">
+  <input id="slider" type="range" min="1" max="1" value="1" aria-label="이미지 이동">
+  <div class="row">
+    <button id="fit"></button>
+    <button id="dir"></button>
+  </div>
+  <div class="hint" id="hint"></div>
+</div>
+<div id="toast"></div>
+
+<script>
+var DATA = /*__DATA__*/null;
+</script>
+<script>
+(function () {
+  'use strict';
+  var D = DATA || { images: [], start: 0, title: '', prefs: {} };
+  var list = D.images || [], n = list.length;
+  var prefs = D.prefs || {};
+  var fitMode = prefs.fit || 'auto';      // auto | screen | width
+  var rtl = !!prefs.rtl;                   // true 면 왼쪽 탭이 "다음"
+  var B = window.ViewerBridge;
+
+  function $(id) { return document.getElementById(id); }
+  var stage = $('stage'), img = $('img'), status = $('status'), corner = $('corner');
+  var idx = Math.max(0, Math.min(n - 1, D.start | 0));
+  var token = 0, spinTimer = 0, cache = {};
+  var scale = 1, tx = 0, ty = 0;
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  /* ---------- 확대/이동 ---------- */
+  function applyT() {
+    img.style.transform = (scale === 1 && tx === 0 && ty === 0) ? '' : 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
+  }
+  function clampPan() {
+    var mx = Math.max(0, (img.offsetWidth * scale - innerWidth) / 2);
+    var my = Math.max(0, (img.offsetHeight * scale - innerHeight) / 2);
+    tx = clamp(tx, -mx, mx); ty = clamp(ty, -my, my);
+  }
+  function resetZoom() { scale = 1; tx = ty = 0; applyT(); }
+
+  /* ---------- 맞춤 모드 ---------- */
+  function isTall() {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    return !!(w && h) && (h / w) > (innerHeight / innerWidth) * 1.6;
+  }
+  function useScroll() { return fitMode === 'width' || (fitMode === 'auto' && isTall()); }
+  function applyFit(where) {
+    var sc = useScroll();
+    stage.classList.toggle('scroll', sc);
+    if (sc) stage.scrollTop = where === 'bottom' ? stage.scrollHeight : 0;
+  }
+
+  /* ---------- 표시 ---------- */
+  function show(i, where) {
+    if (!n) return;
+    idx = clamp(i, 0, n - 1);
+    resetZoom();
+    var url = list[idx], my = ++token;
+    img.style.visibility = 'hidden';
+    status.innerHTML = '';
+    clearTimeout(spinTimer);
+    spinTimer = setTimeout(function () { if (my === token) status.innerHTML = '<div class="spin"></div>'; }, 180);
+    img.onload = function () {
+      if (my !== token) return;
+      clearTimeout(spinTimer);
+      status.innerHTML = '';
+      applyFit(where);
+      img.style.visibility = 'visible';
+    };
+    img.onerror = function () {
+      if (my !== token) return;
+      clearTimeout(spinTimer);
+      status.innerHTML = '<div>이미지를 불러오지 못했어요</div><div class="url">' + esc(url.slice(0, 300)) +
+        '</div><button id="retry">다시 시도</button>';
+      $('retry').onclick = function () { show(idx, where); };
+    };
+    img.removeAttribute('src');
+    img.src = url;
+    updateUI();
+    preload();
+    if (B && B.onIndex) B.onIndex(idx);
+  }
+
+  function preload() {
+    var want = {};
+    [idx + 1, idx + 2, idx + 3, idx - 1].forEach(function (j) {
+      if (j < 0 || j >= n) return;
+      var u = list[j];
+      want[u] = 1;
+      if (!cache[u]) { var im = new Image(); im.src = u; cache[u] = im; }
+    });
+    Object.keys(cache).forEach(function (u) { if (!want[u] && u !== list[idx]) delete cache[u]; });
+  }
+
+  function next() {
+    if (useScroll() && stage.scrollTop + stage.clientHeight < stage.scrollHeight - 4) {
+      stage.scrollBy({ top: stage.clientHeight * 0.85, behavior: 'smooth' });
+      return;
+    }
+    if (idx >= n - 1) { toast('마지막 이미지예요'); return; }
+    show(idx + 1, 'top');
+  }
+  function prev() {
+    if (useScroll() && stage.scrollTop > 4) {
+      stage.scrollBy({ top: -stage.clientHeight * 0.85, behavior: 'smooth' });
+      return;
+    }
+    if (idx <= 0) { toast('첫 이미지예요'); return; }
+    show(idx - 1, 'bottom');
+  }
+  window.ivNav = function (d) { if (d > 0) next(); else prev(); };
+
+  /* ---------- 메뉴(HUD) ---------- */
+  var FIT_LABEL = { auto: '맞춤: 자동', screen: '맞춤: 화면 전체', width: '맞춤: 가로 폭' };
+  function updateUI() {
+    var c = (idx + 1) + ' / ' + n;
+    $('count').textContent = c;
+    corner.textContent = c;
+    $('slider').max = String(Math.max(1, n));
+    $('slider').value = String(idx + 1);
+    $('title').textContent = D.title || '';
+    $('fit').textContent = FIT_LABEL[fitMode];
+    $('dir').textContent = rtl ? '넘김: 왼쪽이 다음' : '넘김: 오른쪽이 다음';
+    $('hint').textContent = (rtl ? '왼쪽 탭: 다음 · 오른쪽 탭: 이전' : '오른쪽 탭: 다음 · 왼쪽 탭: 이전') +
+      ' · 가운데 탭: 메뉴 · 두 손가락: 확대 · 볼륨키로도 넘김';
+  }
+  function toggleHud() { document.body.classList.toggle('hide'); }
+  function hideHud() { document.body.classList.add('hide'); }
+
+  var toastTimer = 0;
+  function toast(msg) {
+    var t = $('toast');
+    t.textContent = msg; t.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.remove('on'); }, 1400);
+  }
+  function savePref(k, v) { try { if (B && B.setPref) B.setPref(k, String(v)); } catch (e) {} }
+
+  $('close').onclick = function () { if (B && B.close) B.close(); };
+  $('slider').oninput = function () { $('count').textContent = this.value + ' / ' + n; };
+  $('slider').onchange = function () { show((this.value | 0) - 1, 'top'); };
+  $('fit').onclick = function () {
+    fitMode = fitMode === 'auto' ? 'screen' : fitMode === 'screen' ? 'width' : 'auto';
+    savePref('fit', fitMode); resetZoom(); applyFit('top'); updateUI();
+  };
+  $('dir').onclick = function () { rtl = !rtl; savePref('rtl', rtl); updateUI(); };
+
+  /* ---------- 터치: 탭 / 스와이프 / 두 손가락 확대 ---------- */
+  function onTap(x) {
+    var w = innerWidth;
+    if (x > w * 0.35 && x < w * 0.65) { toggleHud(); return; }
+    hideHud();
+    var forward = (x >= w * 0.65) !== rtl;
+    if (forward) next(); else prev();
+  }
+  function inUI(t) { return t && t.closest && t.closest('button, input, .hud'); }
+  function dist(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
+
+  var t0 = null, pinch = null, pan = null, moved = false, multi = false, lastTouch = 0;
+
+  window.addEventListener('touchstart', function (e) {
+    lastTouch = Date.now();
+    if (inUI(e.target)) { t0 = null; pinch = null; pan = null; return; }
+    if (e.touches.length === 1) {
+      var p = e.touches[0];
+      t0 = { x: p.clientX, y: p.clientY, t: Date.now() };
+      moved = false; multi = false;
+      pan = scale > 1 ? { x: p.clientX, y: p.clientY, tx: tx, ty: ty } : null;
+    } else if (e.touches.length === 2 && !stage.classList.contains('scroll')) {
+      multi = true; pan = null;
+      var a = e.touches[0], b = e.touches[1];
+      var mx = (a.clientX + b.clientX) / 2 - innerWidth / 2, my = (a.clientY + b.clientY) / 2 - innerHeight / 2;
+      pinch = { d: dist(a, b) || 1, s: scale, qx: (mx - tx) / scale, qy: (my - ty) / scale };
+    } else {
+      multi = true;
+    }
+  }, { passive: true });
+
+  window.addEventListener('touchmove', function (e) {
+    if (pinch && e.touches.length === 2) {
+      e.preventDefault();
+      var a = e.touches[0], b = e.touches[1];
+      var s = clamp(pinch.s * dist(a, b) / pinch.d, 1, 6);
+      var mx = (a.clientX + b.clientX) / 2 - innerWidth / 2, my = (a.clientY + b.clientY) / 2 - innerHeight / 2;
+      scale = s; tx = mx - pinch.qx * s; ty = my - pinch.qy * s;
+      clampPan(); applyT(); moved = true;
+      return;
+    }
+    if (t0 && e.touches.length === 1) {
+      var p = e.touches[0];
+      if (Math.abs(p.clientX - t0.x) > 10 || Math.abs(p.clientY - t0.y) > 10) moved = true;
+      if (pan) {
+        e.preventDefault();
+        tx = pan.tx + (p.clientX - pan.x); ty = pan.ty + (p.clientY - pan.y);
+        clampPan(); applyT();
+      } else if (!stage.classList.contains('scroll')) {
+        e.preventDefault();
+      }
+    }
+  }, { passive: false });
+
+  window.addEventListener('touchend', function (e) {
+    lastTouch = Date.now();
+    if (pinch && e.touches.length < 2) {
+      pinch = null;
+      if (scale < 1.03) resetZoom();
+      if (e.touches.length === 1 && scale > 1) {
+        var q = e.touches[0];
+        pan = { x: q.clientX, y: q.clientY, tx: tx, ty: ty };
+      }
+      return;
+    }
+    if (!t0 || e.touches.length) return;
+    var p = e.changedTouches[0], dx = p.clientX - t0.x, dy = p.clientY - t0.y, dt = Date.now() - t0.t;
+    var wasPan = !!pan;
+    t0 = null; pan = null;
+    if (multi) return;
+    if (!moved && dt < 500) { e.preventDefault(); onTap(p.clientX); return; }
+    if (!wasPan && scale === 1 && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 800) {
+      var forward = (dx < 0) !== rtl;
+      if (forward) next(); else prev();
+    }
+  }, { passive: false });
+
+  // 마우스(에뮬레이터·PC 테스트용)
+  window.addEventListener('click', function (e) {
+    if (Date.now() - lastTouch < 800 || inUI(e.target)) return;
+    onTap(e.clientX);
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') next();
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') prev();
+    else if (e.key === 'Escape' && B && B.close) B.close();
+  });
+  window.addEventListener('resize', function () {
+    resetZoom();
+    stage.classList.toggle('scroll', useScroll());
+  });
+
+  /* ---------- 시작 ---------- */
+  if (!n) {
+    status.innerHTML = '<div>이 페이지에서 이미지를 찾지 못했어요</div>';
+    document.body.classList.remove('hide');
+  } else {
+    show(idx, 'top');
+    document.body.classList.remove('hide');
+    setTimeout(hideHud, 2200);
+  }
+})();
+</script>
+</body>
+</html>
